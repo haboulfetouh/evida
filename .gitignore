@@ -1,0 +1,9 @@
+node_modules
+dist
+.next
+.env
+coverage
+*.log
+apps/api/src/generated
+apps/web/tsconfig.tsbuildinfo
+.DS_Store

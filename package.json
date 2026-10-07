@@ -1,0 +1,27 @@
+{
+  "name": "evida",
+  "private": true,
+  "version": "0.1.0",
+  "description": "EVIDA \u2014 Evidence Driven Hiring Platform",
+  "workspaces": [
+    "apps/api",
+    "apps/web"
+  ],
+  "scripts": {
+    "dev:api": "npm run start:dev -w apps/api",
+    "dev:worker": "npm run worker:dev -w apps/api",
+    "dev:web": "npm run dev -w apps/web",
+    "db:migrate": "npm run prisma:migrate -w apps/api",
+    "db:seed": "npm run prisma:seed -w apps/api",
+    "typecheck": "npm run typecheck -w apps/api && npm run typecheck -w apps/web",
+    "test": "npm test -w apps/api",
+    "build": "npm run build -w apps/api && npm run build -w apps/web",
+    "db:diff": "npm run db:diff -w apps/api --",
+    "test:e2e": "npm run test:e2e -w apps/api",
+    "eval:ai": "npm run eval:ai -w apps/api"
+  },
+  "overrides": {
+    "@types/react": "^19.0.0",
+    "@types/react-dom": "^19.0.0"
+  }
+}

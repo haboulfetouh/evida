@@ -1,0 +1,675 @@
+// EVIDA data model.
+// Every tenant-owned table carries organizationId; tenant scoping is enforced in the
+// service layer (TenantPrisma) and optionally by PostgreSQL RLS (see migrations/rls.sql).
+
+generator client {
+  provider     = "prisma-client"
+  output       = "../src/generated/prisma"
+  moduleFormat = "cjs"
+}
+
+// Connection URL lives in prisma.config.ts (Prisma 7). The runtime client uses the
+// Rust-free query compiler with the node-postgres driver adapter (see src/common/prisma.service.ts).
+datasource db {
+  provider = "postgresql"
+}
+
+// ───────────────────────── Tenancy & identity ─────────────────────────
+
+model Organization {
+  id                 String   @id @default(uuid()) @db.Uuid
+  name               String
+  slug               String   @unique
+  locale             String   @default("en")
+  blindReviewEnabled Boolean  @default(false)
+  recordingEnabled   Boolean  @default(false)
+  aiProvider         String   @default("anthropic")
+  consentPolicyVersion String @default("2026-10-v1")
+  retention          Json     @default("{\"recordingsDays\":90,\"transcriptsDays\":180,\"candidatesDays\":730,\"auditDays\":2555}")
+  createdAt          DateTime @default(now())
+  updatedAt          DateTime @updatedAt
+
+  users       User[]
+  jobs        Job[]
+  candidates  Candidate[]
+  interviews  Interview[]
+  auditLogs   AuditLog[]
+  aiRuns      AIProcessingRun[]
+  webhooks    Webhook[]
+}
+
+enum Role {
+  SYSTEM_ADMIN
+  ORG_ADMIN
+  HR_DIRECTOR
+  RECRUITER
+  HIRING_MANAGER
+  INTERVIEWER
+  VIEWER
+}
+
+model User {
+  id             String    @id @default(uuid()) @db.Uuid
+  organizationId String    @db.Uuid
+  email          String
+  name           String
+  passwordHash   String?
+  roles          Role[]
+  isActive       Boolean   @default(true)
+  failedLogins   Int       @default(0)
+  lockedUntil    DateTime?
+  lastLoginAt    DateTime?
+  createdAt      DateTime  @default(now())
+  updatedAt      DateTime  @updatedAt
+  deletedAt      DateTime?
+
+  organization  Organization  @relation(fields: [organizationId], references: [id])
+  refreshTokens RefreshToken[]
+  participations InterviewParticipant[]
+  scorecards    Scorecard[]
+
+  @@unique([organizationId, email])
+  @@index([organizationId])
+}
+
+model LoginToken {
+  id        String    @id @default(uuid()) @db.Uuid
+  userId    String    @db.Uuid
+  tokenHash String    @unique
+  purpose   String    @default("MAGIC_LINK") // MAGIC_LINK | INVITE
+  expiresAt DateTime
+  usedAt    DateTime?
+  createdAt DateTime  @default(now())
+
+  @@index([userId])
+}
+
+model RefreshToken {
+  id         String    @id @default(uuid()) @db.Uuid
+  userId     String    @db.Uuid
+  tokenHash  String    @unique
+  familyId   String    @db.Uuid
+  expiresAt  DateTime
+  revokedAt  DateTime?
+  replacedBy String?   @db.Uuid
+  createdAt  DateTime  @default(now())
+  user       User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+
+  @@index([userId])
+  @@index([familyId])
+}
+
+// ───────────────────────── Jobs & competencies ─────────────────────────
+
+enum JobStatus {
+  DRAFT
+  OPEN
+  ON_HOLD
+  CLOSED
+}
+
+model Job {
+  id                 String    @id @default(uuid()) @db.Uuid
+  organizationId     String    @db.Uuid
+  title              String
+  department         String?
+  location           String?
+  employmentType     String?
+  description        String
+  requiredExperience String?
+  requiredSkills     String[]
+  preferredSkills    String[]
+  salaryRange        String?
+  hiringManagerId    String?   @db.Uuid
+  recruiterId        String?   @db.Uuid
+  openingDate        DateTime?
+  closingDate        DateTime?
+  positions          Int       @default(1)
+  status             JobStatus @default(DRAFT)
+  version            Int       @default(1)
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  deletedAt          DateTime?
+
+  organization  Organization   @relation(fields: [organizationId], references: [id])
+  competencies  Competency[]
+  plans         InterviewPlan[]
+  applications  Application[]
+
+  @@index([organizationId, status])
+}
+
+enum ContentOrigin {
+  HUMAN
+  AI_GENERATED
+  AI_APPROVED
+}
+
+model Competency {
+  id                 String        @id @default(uuid()) @db.Uuid
+  organizationId     String        @db.Uuid
+  jobId              String        @db.Uuid
+  key                String
+  name               String
+  description        String
+  weight             Float         @default(1)
+  requiredLevel      Int           @default(3)
+  evaluationCriteria String?
+  indicators         Json          @default("[]") // behavioral indicators
+  positiveExamples   String[]
+  negativeExamples   String[]
+  origin             ContentOrigin @default(HUMAN)
+  approvedById       String?       @db.Uuid
+  approvedAt         DateTime?
+  createdAt          DateTime      @default(now())
+  updatedAt          DateTime      @updatedAt
+
+  job       Job        @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  questions Question[]
+  evidence  Evidence[]
+  scores    Score[]
+
+  @@unique([jobId, key])
+  @@index([organizationId])
+}
+
+model Question {
+  id             String        @id @default(uuid()) @db.Uuid
+  organizationId String        @db.Uuid
+  competencyId   String        @db.Uuid
+  stageId        String?       @db.Uuid
+  text           String
+  followUps      String[]
+  category       String        @default("behavioral")
+  order          Int           @default(0)
+  origin         ContentOrigin @default(HUMAN)
+  createdAt      DateTime      @default(now())
+
+  competency Competency      @relation(fields: [competencyId], references: [id], onDelete: Cascade)
+  stage      InterviewStage? @relation(fields: [stageId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId])
+}
+
+enum PlanStatus {
+  DRAFT
+  ACTIVE
+  ARCHIVED
+}
+
+model InterviewPlan {
+  id             String        @id @default(uuid()) @db.Uuid
+  organizationId String        @db.Uuid
+  jobId          String        @db.Uuid
+  name           String
+  status         PlanStatus    @default(DRAFT)
+  origin         ContentOrigin @default(HUMAN)
+  scoringRubric  Json          @default("{}")
+  approvedById   String?       @db.Uuid
+  approvedAt     DateTime?
+  version        Int           @default(1)
+  createdAt      DateTime      @default(now())
+  updatedAt      DateTime      @updatedAt
+
+  job    Job              @relation(fields: [jobId], references: [id], onDelete: Cascade)
+  stages InterviewStage[]
+
+  @@index([organizationId, jobId])
+}
+
+model InterviewStage {
+  id              String   @id @default(uuid()) @db.Uuid
+  organizationId  String   @db.Uuid
+  planId          String   @db.Uuid
+  name            String
+  order           Int
+  durationMinutes Int
+  competencyKeys  String[]
+
+  plan       InterviewPlan @relation(fields: [planId], references: [id], onDelete: Cascade)
+  questions  Question[]
+  interviews Interview[]
+
+  @@index([planId])
+}
+
+// ───────────────────────── Candidates ─────────────────────────
+
+enum CandidateStage {
+  APPLIED
+  SCREENING
+  INTERVIEW_SCHEDULED
+  INTERVIEW_COMPLETED
+  ASSESSMENT
+  FINAL_INTERVIEW
+  OFFER
+  HIRED
+  REJECTED
+  WITHDRAWN
+  ON_HOLD
+}
+
+model Candidate {
+  id                 String    @id @default(uuid()) @db.Uuid
+  organizationId     String    @db.Uuid
+  name               String
+  email              String
+  phone              String?
+  location           String?
+  linkedinUrl        String?
+  currentCompany     String?
+  currentPosition    String?
+  yearsExperience    Float?
+  skills             String[]
+  education          Json      @default("[]")
+  source             String?
+  salaryExpectation  String?
+  noticePeriod       String?
+  recruiterNotes     String?
+  cvFileId           String?   @db.Uuid
+  cvAnalysis         Json?
+  isSynthetic        Boolean   @default(false)
+  createdAt          DateTime  @default(now())
+  updatedAt          DateTime  @updatedAt
+  deletedAt          DateTime?
+
+  organization Organization  @relation(fields: [organizationId], references: [id])
+  applications Application[]
+
+  @@unique([organizationId, email])
+  @@index([organizationId])
+}
+
+model Application {
+  id             String         @id @default(uuid()) @db.Uuid
+  organizationId String         @db.Uuid
+  jobId          String         @db.Uuid
+  candidateId    String         @db.Uuid
+  stage          CandidateStage @default(APPLIED)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  job        Job         @relation(fields: [jobId], references: [id])
+  candidate  Candidate   @relation(fields: [candidateId], references: [id])
+  interviews Interview[]
+  decisions  Decision[]
+  summary    DecisionSummary?
+
+  @@unique([jobId, candidateId])
+  @@index([organizationId, stage])
+}
+
+// ───────────────────────── Interviews ─────────────────────────
+
+enum InterviewStatus {
+  SCHEDULED
+  IN_PROGRESS
+  COMPLETED
+  CANCELLED
+}
+
+enum AIStatus {
+  NOT_STARTED
+  QUEUED
+  PROCESSING
+  READY
+  FAILED
+  SKIPPED_NO_CONSENT
+}
+
+model Interview {
+  id               String          @id @default(uuid()) @db.Uuid
+  organizationId   String          @db.Uuid
+  applicationId    String          @db.Uuid
+  stageId          String          @db.Uuid
+  scheduledAt      DateTime
+  durationMinutes  Int
+  status           InterviewStatus @default(SCHEDULED)
+  roomName         String          @unique // random, non-guessable
+  recordingEnabled Boolean         @default(false)
+  aiStatus         AIStatus        @default(NOT_STARTED)
+  aiProcessedSeq   Int             @default(-1) // last transcript segment seq processed by live extraction
+  aiSuggestions    Json?           // latest evidence-linked score suggestions (ScoreSuggestionSchema)
+  candidateTokenHash String?       @unique // magic link for candidate portal
+  candidateTokenExpiresAt DateTime?
+  startedAt        DateTime?
+  endedAt          DateTime?
+  createdAt        DateTime        @default(now())
+  updatedAt        DateTime        @updatedAt
+
+  organization Organization           @relation(fields: [organizationId], references: [id])
+  application  Application            @relation(fields: [applicationId], references: [id])
+  stage        InterviewStage         @relation(fields: [stageId], references: [id])
+  participants InterviewParticipant[]
+  consents     ConsentRecord[]
+  transcript   Transcript?
+  evidence     Evidence[]
+  scorecards   Scorecard[]
+  notes        InterviewNote[]
+  feedback     CandidateFeedback?
+  recordings   Recording[]
+
+  @@index([organizationId, scheduledAt])
+}
+
+model InterviewParticipant {
+  id          String    @id @default(uuid()) @db.Uuid
+  interviewId String    @db.Uuid
+  userId      String    @db.Uuid
+  isLead      Boolean   @default(false)
+  interview   Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  user        User      @relation(fields: [userId], references: [id])
+
+  @@unique([interviewId, userId])
+}
+
+model InterviewNote {
+  id          String    @id @default(uuid()) @db.Uuid
+  interviewId String    @db.Uuid
+  authorId    String    @db.Uuid
+  body        String
+  createdAt   DateTime  @default(now())
+  interview   Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+}
+
+enum ConsentType {
+  RECORDING
+  TRANSCRIPTION
+  AI_ANALYSIS
+  PROFILING
+}
+
+model ConsentRecord {
+  id             String      @id @default(uuid()) @db.Uuid
+  organizationId String      @db.Uuid
+  interviewId    String      @db.Uuid
+  type           ConsentType
+  version        String
+  granted        Boolean
+  ipAddress      String?
+  userAgent      String?
+  grantedAt      DateTime    @default(now())
+  withdrawnAt    DateTime?
+  interview      Interview   @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+
+  @@index([interviewId, type])
+}
+
+model Transcript {
+  id          String              @id @default(uuid()) @db.Uuid
+  interviewId String              @unique @db.Uuid
+  source      String              @default("upload") // upload | jitsi-transcriber | live
+  language    String              @default("en")
+  createdAt   DateTime            @default(now())
+  interview   Interview           @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  segments    TranscriptSegment[]
+}
+
+model TranscriptSegment {
+  id           String     @id @default(uuid()) @db.Uuid
+  transcriptId String     @db.Uuid
+  seq          Int
+  speaker      String     // CANDIDATE | INTERVIEWER | <name>
+  startSec     Int
+  endSec       Int
+  text         String
+  transcript   Transcript @relation(fields: [transcriptId], references: [id], onDelete: Cascade)
+  evidence     Evidence[]
+
+  @@unique([transcriptId, seq])
+}
+
+// ───────────────────────── Evidence, scoring, decisions ─────────────────────────
+
+enum EvidenceStatus {
+  AI_DETECTED
+  CONFIRMED
+  REJECTED
+  EDITED
+  HUMAN_ADDED
+}
+
+enum EvidenceType {
+  OBSERVED      // directly stated by the candidate
+  INFERRED      // AI inference from statements — always labelled
+}
+
+model Evidence {
+  id             String         @id @default(uuid()) @db.Uuid
+  organizationId String         @db.Uuid
+  interviewId    String         @db.Uuid
+  competencyId   String         @db.Uuid
+  segmentId      String?        @db.Uuid
+  quote          String         // verbatim excerpt from the transcript
+  summary        String
+  speaker        String
+  timestampSec   Int?
+  confidence     Float
+  polarity       String         @default("positive") // positive | negative
+  type           EvidenceType   @default(OBSERVED)
+  status         EvidenceStatus @default(AI_DETECTED)
+  validatedById  String?        @db.Uuid
+  validatedAt    DateTime?
+  aiRunId        String?        @db.Uuid
+  version        Int            @default(1)
+  createdAt      DateTime       @default(now())
+  updatedAt      DateTime       @updatedAt
+
+  interview  Interview          @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  competency Competency         @relation(fields: [competencyId], references: [id], onDelete: Cascade)
+  segment    TranscriptSegment? @relation(fields: [segmentId], references: [id], onDelete: SetNull)
+
+  @@index([organizationId, interviewId])
+  @@index([competencyId])
+}
+
+enum Recommendation {
+  STRONG_HIRE
+  HIRE
+  CONSIDER
+  NO_HIRE
+  STRONG_NO_HIRE
+}
+
+model Scorecard {
+  id             String          @id @default(uuid()) @db.Uuid
+  organizationId String          @db.Uuid
+  interviewId    String          @db.Uuid
+  interviewerId  String          @db.Uuid
+  recommendation Recommendation?
+  comments       String?
+  submittedAt    DateTime?
+  version        Int             @default(1)
+  createdAt      DateTime        @default(now())
+  updatedAt      DateTime        @updatedAt
+
+  interview   Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+  interviewer User      @relation(fields: [interviewerId], references: [id])
+  scores      Score[]
+
+  @@unique([interviewId, interviewerId])
+}
+
+model Score {
+  id             String     @id @default(uuid()) @db.Uuid
+  scorecardId    String     @db.Uuid
+  competencyId   String     @db.Uuid
+  value          Int?       // 1..5, null = insufficient evidence
+  confidence     String     @default("medium")
+  comment        String?
+  aiSuggested    Int?
+  aiRationale    String?
+  evidenceIds    String[]   @db.Uuid
+  scorecard      Scorecard  @relation(fields: [scorecardId], references: [id], onDelete: Cascade)
+  competency     Competency @relation(fields: [competencyId], references: [id], onDelete: Cascade)
+
+  @@unique([scorecardId, competencyId])
+}
+
+model DecisionSummary {
+  id             String      @id @default(uuid()) @db.Uuid
+  organizationId String      @db.Uuid
+  applicationId  String      @unique @db.Uuid
+  content        Json        // validated by DecisionSummarySchema
+  aiRunId        String?     @db.Uuid
+  createdAt      DateTime    @default(now())
+  updatedAt      DateTime    @updatedAt
+  application    Application @relation(fields: [applicationId], references: [id], onDelete: Cascade)
+}
+
+enum DecisionOutcome {
+  HIRE
+  REJECT
+  HOLD
+  ADDITIONAL_INTERVIEW
+  OFFER
+}
+
+model Decision {
+  id                  String          @id @default(uuid()) @db.Uuid
+  organizationId      String          @db.Uuid
+  applicationId       String          @db.Uuid
+  outcome             DecisionOutcome
+  reason              String
+  decidedById         String          @db.Uuid
+  evidenceCoverage    Float
+  unresolvedAreas     String[]
+  supersedesId        String?         @db.Uuid
+  createdAt           DateTime        @default(now())
+  application         Application     @relation(fields: [applicationId], references: [id])
+
+  @@index([organizationId, applicationId])
+}
+
+model CandidateFeedback {
+  id           String    @id @default(uuid()) @db.Uuid
+  interviewId  String    @unique @db.Uuid
+  rating       Int
+  structured   Boolean?
+  understood   Boolean?
+  respected    Boolean?
+  clear        Boolean?
+  comment      String?
+  createdAt    DateTime  @default(now())
+  interview    Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+}
+
+// ───────────────────────── Files, AI governance, audit, integrations ─────────────────────────
+
+model File {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @db.Uuid
+  storageKey     String   @unique // random key; original filename never used as path
+  originalName   String
+  mimeType       String
+  sizeBytes      Int
+  sha256         String
+  classification String   @default("HIGHLY_CONFIDENTIAL")
+  scanStatus     String   @default("PENDING") // PENDING | CLEAN | INFECTED | SKIPPED
+  uploadedById   String?  @db.Uuid
+  createdAt      DateTime @default(now())
+  deletedAt      DateTime?
+
+  @@index([organizationId])
+}
+
+model AIProcessingRun {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @db.Uuid
+  purpose        String   // prompt id
+  promptVersion  String
+  provider       String
+  model          String
+  subjectType    String
+  subjectId      String   @db.Uuid
+  status         String   // SUCCEEDED | FAILED | REJECTED_SCHEMA
+  inputTokens    Int      @default(0)
+  outputTokens   Int      @default(0)
+  costUsd        Float    @default(0)
+  latencyMs      Int      @default(0)
+  error          String?
+  createdAt      DateTime @default(now())
+
+  organization Organization @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId, createdAt])
+  @@index([subjectType, subjectId])
+}
+
+model AuditLog {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String?  @db.Uuid
+  actorId        String?  @db.Uuid
+  actorType      String   // USER | CANDIDATE | SYSTEM
+  action         String
+  resourceType   String
+  resourceId     String?
+  result         String   @default("SUCCESS")
+  ipAddress      String?
+  userAgent      String?
+  requestId      String?
+  metadata       Json?
+  createdAt      DateTime @default(now())
+
+  organization Organization? @relation(fields: [organizationId], references: [id])
+
+  @@index([organizationId, createdAt])
+  @@index([resourceType, resourceId])
+}
+
+model Webhook {
+  id             String   @id @default(uuid()) @db.Uuid
+  organizationId String   @db.Uuid
+  url            String
+  secret         String
+  events         String[]
+  isActive       Boolean  @default(true)
+  createdAt      DateTime @default(now())
+  organization   Organization @relation(fields: [organizationId], references: [id])
+}
+
+model Notification {
+  id             String    @id @default(uuid()) @db.Uuid
+  organizationId String    @db.Uuid
+  userId         String?   @db.Uuid
+  channel        String    // EMAIL | IN_APP
+  template       String
+  recipient      String
+  title          String?
+  link           String?
+  status         String    @default("QUEUED") // QUEUED | SENT | FAILED | READ
+  sentAt         DateTime?
+  readAt         DateTime?
+  createdAt      DateTime  @default(now())
+
+  @@index([organizationId, userId, status])
+}
+
+model Recording {
+  id             String    @id @default(uuid()) @db.Uuid
+  organizationId String    @db.Uuid
+  interviewId    String    @db.Uuid
+  fileId         String    @db.Uuid
+  durationSec    Int?
+  expiresAt      DateTime
+  createdAt      DateTime  @default(now())
+  deletedAt      DateTime?
+  interview      Interview @relation(fields: [interviewId], references: [id], onDelete: Cascade)
+
+  @@index([organizationId, expiresAt])
+}
+
+model WebhookDelivery {
+  id          String    @id @default(uuid()) @db.Uuid
+  webhookId   String    @db.Uuid
+  event       String
+  eventId     String    @db.Uuid
+  status      String    @default("PENDING") // PENDING | DELIVERED | FAILED | DEAD
+  attempts    Int       @default(0)
+  lastStatus  Int?
+  lastError   String?
+  deliveredAt DateTime?
+  createdAt   DateTime  @default(now())
+
+  @@unique([webhookId, eventId])
+}

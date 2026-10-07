@@ -1,0 +1,20 @@
+# Production baseline: kubectl apply -k infra/k8s  (override images/hosts with a kustomize overlay per environment)
+apiVersion: kustomize.config.k8s.io/v1beta1
+kind: Kustomization
+namespace: evida
+resources:
+  - namespace.yaml
+  - config.yaml
+  - migrate-job.yaml
+  - api.yaml
+  - worker.yaml
+  - web.yaml
+  - ingress.yaml
+  - network-policy.yaml
+images:
+  - name: evida-api
+    newName: ghcr.io/your-org/evida-api
+    newTag: "0.1.0"
+  - name: evida-web
+    newName: ghcr.io/your-org/evida-web
+    newTag: "0.1.0"

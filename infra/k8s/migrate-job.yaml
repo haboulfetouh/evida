@@ -1,0 +1,19 @@
+# Run once per release before rolling out api/worker (CI applies it and waits for completion).
+apiVersion: batch/v1
+kind: Job
+metadata:
+  name: evida-migrate
+spec:
+  backoffLimit: 2
+  ttlSecondsAfterFinished: 3600
+  template:
+    spec:
+      restartPolicy: Never
+      securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: migrate
+          image: evida-api
+          command: ["node", "scripts/migrate-deploy.mjs"]
+          envFrom: [{ secretRef: { name: evida-secrets } }]
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          resources: { requests: { cpu: 50m, memory: 128Mi }, limits: { memory: 256Mi } }

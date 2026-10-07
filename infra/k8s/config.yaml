@@ -1,0 +1,48 @@
+# Non-secret configuration. Secrets (DATABASE_URL, JWT_*, ANTHROPIC_API_KEY, JITSI_*, S3_*, SMTP_*, SENTRY_DSN)
+# come from the "evida-secrets" Secret, which should be synced from your secrets manager
+# (e.g. External Secrets Operator → AWS Secrets Manager / Azure Key Vault / Vault). Never commit it.
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: evida-config
+data:
+  NODE_ENV: production
+  API_PORT: "4000"
+  WEB_ORIGIN: https://evida.example.com
+  COOKIE_SECURE: "true"
+  AI_PROVIDER: anthropic
+  AI_MODEL_REASONING: claude-sonnet-5-5
+  AI_MODEL_FAST: claude-haiku-4-5-20251001
+  AI_PROCESSING_LOCATION: anthropic-us
+  JITSI_DOMAIN: meet.evida.example.com
+  JITSI_APP_ID: evida
+  S3_REGION: eu-central-1
+  S3_BUCKET: evida-prod
+  CLAMAV_HOST: clamav.evida-infra.svc.cluster.local
+  MAX_UPLOAD_MB: "10"
+  OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector.observability.svc.cluster.local:4318
+  DB_POOL_MAX: "15"
+  DEFAULT_TZ: Africa/Cairo
+---
+# Example only — create the real Secret from your secrets manager.
+apiVersion: v1
+kind: Secret
+metadata:
+  name: evida-secrets
+type: Opaque
+stringData:
+  DATABASE_URL: "postgresql://evida:REPLACE@managed-postgres:5432/evida?sslmode=require"
+  REDIS_URL: "rediss://:REPLACE@managed-redis:6380"
+  JWT_ACCESS_SECRET: "REPLACE"
+  JWT_REFRESH_SECRET: "REPLACE"
+  JITSI_APP_SECRET: "REPLACE"
+  JITSI_WEBHOOK_SECRET: "REPLACE"
+  ANTHROPIC_API_KEY: "REPLACE"
+  S3_ACCESS_KEY: "REPLACE"
+  S3_SECRET_KEY: "REPLACE"
+  SMTP_HOST: "REPLACE"
+  SMTP_PORT: "587"
+  SMTP_USER: "REPLACE"
+  SMTP_PASS: "REPLACE"
+  MAIL_FROM: "EVIDA <no-reply@evida.example.com>"
+  SENTRY_DSN: ""

@@ -1,0 +1,187 @@
+# EVIDA local development stack.
+# Jitsi runs as a separate subsystem (profile "video") — never inside the app containers.
+name: evida
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: evida
+      POSTGRES_PASSWORD: evida
+      POSTGRES_DB: evida
+    ports: ["15432:5432"]
+    volumes: [pgdata:/var/lib/postgresql/data]
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U evida"]
+      interval: 5s
+      retries: 10
+
+  redis:
+    image: redis:7-alpine
+    ports: ["16379:6379"]
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: evida
+      MINIO_ROOT_PASSWORD: evidaevida
+    ports: ["19000:9000", "19001:9001"]
+    volumes: [miniodata:/data]
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on: [minio]
+    entrypoint: >
+      /bin/sh -c "sleep 3; mc alias set local http://minio:9000 evida evidaevida;
+      mc mb -p local/evida; mc anonymous set none local/evida; exit 0"
+
+  mailpit:
+    image: axllent/mailpit:latest
+    ports: ["11025:1025", "18025:8025"]
+
+  # One-off migration step (also used as an init container / Job in Kubernetes).
+  migrate:
+    build: { context: ., dockerfile: apps/api/Dockerfile }
+    command: ["node", "scripts/migrate-deploy.mjs"]
+    environment:
+      DATABASE_URL: postgresql://evida:evida@postgres:5432/evida?schema=public
+    depends_on:
+      postgres: { condition: service_healthy }
+    restart: "no"
+
+  api:
+    build: { context: ., dockerfile: apps/api/Dockerfile }
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://evida:evida@postgres:5432/evida?schema=public
+      REDIS_URL: redis://redis:6379
+      S3_ENDPOINT: http://minio:9000
+      SMTP_HOST: mailpit
+      # mailpit's container-internal SMTP port — distinct from .env's SMTP_PORT, which is the
+      # host-mapped port for tools running outside the compose network.
+      SMTP_PORT: "1025"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_SERVICE_NAME: evida-api
+      # Set to "clamav" and start with --profile scan to enable malware scanning of uploads.
+      CLAMAV_HOST: ${CLAMAV_HOST:-}
+    ports: ["14000:4000"]
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+
+  worker:
+    build: { context: ., dockerfile: apps/api/Dockerfile }
+    command: ["node", "dist/worker.js"]
+    env_file: .env
+    environment:
+      DATABASE_URL: postgresql://evida:evida@postgres:5432/evida?schema=public
+      REDIS_URL: redis://redis:6379
+      S3_ENDPOINT: http://minio:9000
+      SMTP_HOST: mailpit
+      SMTP_PORT: "1025"
+      OTEL_EXPORTER_OTLP_ENDPOINT: http://otel-collector:4318
+      OTEL_SERVICE_NAME: evida-worker
+    # The image's baked HEALTHCHECK targets the API's port 4000, but the worker process listens
+    # on WORKER_PORT (4100) and serves its own /health/live there — override it accordingly.
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4100/health/live"]
+      interval: 30s
+      timeout: 3s
+    depends_on:
+      migrate: { condition: service_completed_successfully }
+      redis: { condition: service_healthy }
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        NEXT_PUBLIC_JITSI_DOMAIN: ${JITSI_DOMAIN:-localhost:18443}
+        API_INTERNAL_URL: http://api:4000
+    environment:
+      API_INTERNAL_URL: http://api:4000
+    ports: ["13000:3000"]
+    depends_on: [api]
+
+  # Malware scanning for CV uploads (the API streams files to clamd before storage).
+  clamav:
+    image: clamav/clamav:stable
+    profiles: [scan]
+    ports: ["13310:3310"]
+
+  # ---------- Observability (profile: obs) ----------
+  otel-collector:
+    image: otel/opentelemetry-collector-contrib:latest
+    profiles: [obs]
+    command: ["--config=/etc/otel/config.yaml"]
+    volumes: ["./infra/otel/config.yaml:/etc/otel/config.yaml:ro"]
+    ports: ["14317:4317", "14318:4318", "18889:8889"]
+  prometheus:
+    image: prom/prometheus:latest
+    profiles: [obs]
+    volumes: ["./infra/prometheus/prometheus.yml:/etc/prometheus/prometheus.yml:ro"]
+    ports: ["19090:9090"]
+  tempo:
+    image: grafana/tempo:latest
+    profiles: [obs]
+    command: ["-config.file=/etc/tempo.yaml"]
+    volumes: ["./infra/tempo/tempo.yaml:/etc/tempo.yaml:ro"]
+  loki:
+    image: grafana/loki:latest
+    profiles: [obs]
+    ports: ["13100:3100"]
+  grafana:
+    image: grafana/grafana:latest
+    profiles: [obs]
+    environment:
+      GF_AUTH_ANONYMOUS_ENABLED: "true"
+    volumes: ["./infra/grafana/datasources.yaml:/etc/grafana/provisioning/datasources/ds.yaml:ro"]
+    ports: ["13001:3000"]
+
+  # ---------- Jitsi (profile: video) ----------
+  # For a full JWT-enabled Jitsi, use docker-jitsi-meet with ENABLE_AUTH=1, AUTH_TYPE=jwt,
+  # JWT_APP_ID=$JITSI_APP_ID and JWT_APP_SECRET=$JITSI_APP_SECRET. See docs/DEPLOYMENT.md.
+  jitsi-web:
+    image: jitsi/web:stable
+    profiles: [video]
+    ports: ["18443:443"]
+    environment:
+      ENABLE_AUTH: "1"
+      AUTH_TYPE: jwt
+      JWT_APP_ID: ${JITSI_APP_ID}
+      JWT_APP_SECRET: ${JITSI_APP_SECRET}
+      PUBLIC_URL: https://localhost:18443
+      XMPP_DOMAIN: meet.jitsi
+    networks: { default: { aliases: [meet.jitsi] } }
+  prosody:
+    image: jitsi/prosody:stable
+    profiles: [video]
+    environment:
+      ENABLE_AUTH: "1"
+      AUTH_TYPE: jwt
+      JWT_APP_ID: ${JITSI_APP_ID}
+      JWT_APP_SECRET: ${JITSI_APP_SECRET}
+      JICOFO_AUTH_PASSWORD: evidajicofo
+      JVB_AUTH_PASSWORD: evidajvb
+    networks: { default: { aliases: [xmpp.meet.jitsi] } }
+  jicofo:
+    image: jitsi/jicofo:stable
+    profiles: [video]
+    environment:
+      JICOFO_AUTH_PASSWORD: evidajicofo
+    depends_on: [prosody]
+  jvb:
+    image: jitsi/jvb:stable
+    profiles: [video]
+    ports: ["20000:10000/udp"]
+    environment:
+      JVB_AUTH_PASSWORD: evidajvb
+    depends_on: [prosody]
+
+volumes:
+  pgdata:
+  miniodata:

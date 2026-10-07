@@ -1,0 +1,39 @@
+apiVersion: apps/v1
+kind: Deployment
+metadata:
+  name: evida-web
+  labels: { app: evida-web }
+spec:
+  replicas: 2
+  selector: { matchLabels: { app: evida-web } }
+  template:
+    metadata: { labels: { app: evida-web } }
+    spec:
+      securityContext: { runAsNonRoot: true, seccompProfile: { type: RuntimeDefault } }
+      containers:
+        - name: web
+          image: evida-web
+          ports: [{ containerPort: 3000, name: http }]
+          env: [{ name: API_INTERNAL_URL, value: http://evida-api }]
+          readinessProbe: { httpGet: { path: /login, port: http }, periodSeconds: 10 }
+          livenessProbe: { httpGet: { path: /login, port: http }, periodSeconds: 30 }
+          resources: { requests: { cpu: 100m, memory: 192Mi }, limits: { memory: 512Mi } }
+          securityContext: { allowPrivilegeEscalation: false, readOnlyRootFilesystem: true, capabilities: { drop: [ALL] } }
+          volumeMounts: [{ name: cache, mountPath: /app/apps/web/.next/cache }]
+      volumes: [{ name: cache, emptyDir: {} }]
+---
+apiVersion: v1
+kind: Service
+metadata: { name: evida-web }
+spec:
+  selector: { app: evida-web }
+  ports: [{ port: 80, targetPort: http, name: http }]
+---
+apiVersion: autoscaling/v2
+kind: HorizontalPodAutoscaler
+metadata: { name: evida-web }
+spec:
+  scaleTargetRef: { apiVersion: apps/v1, kind: Deployment, name: evida-web }
+  minReplicas: 2
+  maxReplicas: 8
+  metrics: [{ type: Resource, resource: { name: cpu, target: { type: Utilization, averageUtilization: 70 } } }]
