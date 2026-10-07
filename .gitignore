@@ -7,3 +7,4 @@ coverage
 apps/api/src/generated
 apps/web/tsconfig.tsbuildinfo
 .DS_Store
+.github/workflows/ci.yml
