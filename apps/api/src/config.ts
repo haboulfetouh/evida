@@ -36,6 +36,9 @@ const EnvSchema = z.object({
   JITSI_WEBHOOK_SECRET: z.string().optional(),
 
   S3_ENDPOINT: z.string().optional(),
+  // Browser-reachable address for presigned URLs — distinct from S3_ENDPOINT when the API
+  // reaches storage over an internal/Docker address that isn't resolvable from outside.
+  S3_PUBLIC_ENDPOINT: z.string().optional(),
   S3_REGION: z.string().default('us-east-1'),
   S3_BUCKET: z.string().default('evida'),
   S3_ACCESS_KEY: z.string().default(''),

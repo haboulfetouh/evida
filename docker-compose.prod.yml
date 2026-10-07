@@ -1,0 +1,219 @@
+# Production stack — single origin (evida.ccsit.co) for the core app, plus a
+# separate hostname for Jitsi (meet.evida.ccsit.co) since its web client and XMPP
+# config hardcode a domain and its video bridge (JVB) needs direct UDP reachability
+# that a reverse proxy can't provide. See docs/DEPLOYMENT.md "Jitsi production architecture".
+#
+# No source bind-mounts, no dev-mode flags. apps/api/Dockerfile and apps/web/Dockerfile
+# are already production multi-stage builds, reused as-is.
+name: evida
+
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    container_name: evida-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_USER: ${POSTGRES_USER}
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD}
+      POSTGRES_DB: ${POSTGRES_DB}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U ${POSTGRES_USER} -d ${POSTGRES_DB}"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [default]
+
+  redis:
+    image: redis:7-alpine
+    container_name: evida-redis
+    restart: unless-stopped
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [default]
+
+  minio:
+    image: minio/minio:latest
+    container_name: evida-minio
+    restart: unless-stopped
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD}
+    volumes:
+      - miniodata:/data
+    healthcheck:
+      test: ["CMD", "mc", "ready", "local"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+    networks: [default, edge]
+
+  minio-init:
+    image: minio/mc:latest
+    depends_on:
+      minio:
+        condition: service_healthy
+    entrypoint: >
+      /bin/sh -c "
+      mc alias set local http://minio:9000 ${MINIO_ROOT_USER} ${MINIO_ROOT_PASSWORD} &&
+      mc mb -p local/${S3_BUCKET} || true &&
+      mc anonymous set none local/${S3_BUCKET} &&
+      exit 0
+      "
+    networks: [default]
+
+  mailpit:
+    image: axllent/mailpit:latest
+    container_name: evida-mailpit
+    restart: unless-stopped
+    networks: [default]
+
+  # CV upload scanning — docs/SECURITY.md calls this required in production.
+  clamav:
+    image: clamav/clamav:stable
+    container_name: evida-clamav
+    restart: unless-stopped
+    networks: [default]
+
+  migrate:
+    build: { context: ., dockerfile: apps/api/Dockerfile }
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+    command: ["node", "scripts/migrate-deploy.mjs"]
+    depends_on:
+      postgres:
+        condition: service_healthy
+    restart: "no"
+    networks: [default]
+
+  api:
+    build: { context: ., dockerfile: apps/api/Dockerfile }
+    container_name: evida-api
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      NODE_ENV: production
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks: [default, edge]
+
+  worker:
+    build: { context: ., dockerfile: apps/api/Dockerfile }
+    container_name: evida-worker
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      DATABASE_URL: ${DATABASE_URL}
+      NODE_ENV: production
+    command: ["node", "dist/worker.js"]
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4100/health/live"]
+      interval: 30s
+      timeout: 3s
+    depends_on:
+      migrate:
+        condition: service_completed_successfully
+      redis:
+        condition: service_healthy
+    networks: [default]
+
+  web:
+    build:
+      context: .
+      dockerfile: apps/web/Dockerfile
+      args:
+        NEXT_PUBLIC_JITSI_DOMAIN: meet.evida.ccsit.co
+        API_INTERNAL_URL: http://api:4000
+        NEXT_PUBLIC_BROWSER_CAPTIONS: "false"
+    container_name: evida-web
+    restart: unless-stopped
+    environment:
+      API_INTERNAL_URL: http://api:4000
+    depends_on: [api]
+    networks: [default, edge]
+
+  # ---------- Jitsi (meet.evida.ccsit.co) ----------
+  jitsi-web:
+    image: jitsi/web:stable
+    container_name: evida-jitsi-web
+    restart: unless-stopped
+    environment:
+      ENABLE_AUTH: "1"
+      AUTH_TYPE: jwt
+      JWT_APP_ID: ${JITSI_APP_ID}
+      JWT_APP_SECRET: ${JITSI_APP_SECRET}
+      JWT_ACCEPTED_ISSUERS: ${JITSI_APP_ID}
+      JWT_ACCEPTED_AUDIENCES: jitsi
+      PUBLIC_URL: https://meet.evida.ccsit.co
+      XMPP_DOMAIN: meet.jitsi
+      # Caddy terminates TLS; serve plain HTTP internally so there's no self-signed-cert hop.
+      DISABLE_HTTPS: "1"
+      ENABLE_HTTP_REDIRECT: "0"
+    networks:
+      default: { aliases: [meet.jitsi] }
+      edge: {}
+
+  prosody:
+    image: jitsi/prosody:stable
+    container_name: evida-prosody
+    restart: unless-stopped
+    environment:
+      ENABLE_AUTH: "1"
+      AUTH_TYPE: jwt
+      JWT_APP_ID: ${JITSI_APP_ID}
+      JWT_APP_SECRET: ${JITSI_APP_SECRET}
+      JWT_ACCEPTED_ISSUERS: ${JITSI_APP_ID}
+      JWT_ACCEPTED_AUDIENCES: jitsi
+      JICOFO_AUTH_PASSWORD: ${JICOFO_AUTH_PASSWORD}
+      JVB_AUTH_PASSWORD: ${JVB_AUTH_PASSWORD}
+      PUBLIC_URL: https://meet.evida.ccsit.co
+    volumes:
+      - prosody_config:/config
+    networks:
+      default: { aliases: [xmpp.meet.jitsi] }
+
+  jicofo:
+    image: jitsi/jicofo:stable
+    container_name: evida-jicofo
+    restart: unless-stopped
+    environment:
+      JICOFO_AUTH_PASSWORD: ${JICOFO_AUTH_PASSWORD}
+    depends_on: [prosody]
+    networks: [default]
+
+  jvb:
+    image: jitsi/jvb:stable
+    container_name: evida-jvb
+    restart: unless-stopped
+    ports:
+      - "10000:10000/udp"
+    environment:
+      JVB_AUTH_PASSWORD: ${JVB_AUTH_PASSWORD}
+      # Without this, JVB advertises its internal Docker bridge IP in ICE candidates,
+      # which is unreachable from the internet — breaks all audio/video silently.
+      DOCKER_HOST_ADDRESS: ${SERVER_PUBLIC_IP}
+      JVB_ADVERTISE_IPS: ${SERVER_PUBLIC_IP}
+    depends_on: [prosody]
+    networks: [default]
+
+volumes:
+  pgdata:
+  miniodata:
+  prosody_config:
+
+networks:
+  default: {}
+  # Shared network so Caddy (in the finops-agent / trimtab stack) can route to this
+  # project's containers by name, without exposing them beyond the host or joining
+  # each other's compose projects.
+  edge:
+    external: true

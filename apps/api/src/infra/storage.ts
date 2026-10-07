@@ -20,6 +20,23 @@ function s3(): S3Client {
   return client;
 }
 
+let publicClient: S3Client | null = null;
+/** Same credentials, signed against the browser-reachable endpoint. Used only for presigned
+ * URLs — "minio:9000" (correct for the API container) doesn't resolve outside the compose network. */
+function s3Public(): S3Client {
+  if (!publicClient) {
+    const e = env();
+    const endpoint = e.S3_PUBLIC_ENDPOINT || e.S3_ENDPOINT;
+    publicClient = new S3Client({
+      region: e.S3_REGION,
+      endpoint: endpoint || undefined,
+      forcePathStyle: Boolean(endpoint),
+      credentials: e.S3_ACCESS_KEY ? { accessKeyId: e.S3_ACCESS_KEY, secretAccessKey: e.S3_SECRET_KEY } : undefined,
+    });
+  }
+  return publicClient;
+}
+
 export async function putObject(key: string, body: Buffer, contentType: string) {
   await s3().send(
     new PutObjectCommand({
@@ -47,7 +64,7 @@ export async function deleteObject(key: string) {
 export async function signedDownloadUrl(key: string, filename: string, ttlSec = 300) {
   const safeName = filename.replace(/[^\w.\- ]+/g, '_').slice(0, 120);
   return getSignedUrl(
-    s3(),
+    s3Public(),
     new GetObjectCommand({ Bucket: env().S3_BUCKET, Key: key, ResponseContentDisposition: `attachment; filename="${safeName}"` }),
     { expiresIn: ttlSec },
   );
